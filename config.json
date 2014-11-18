@@ -8,10 +8,15 @@
             "type": "direct-dir",
             "path": "${OSV_BASE}/mgmt/"
         },
+	"mysql56": {
+	    "name": "mysql56",
+	    "type": "dir",
+	    "path": "${OSV_BASE}/apps/mysql56/"
+        },
     "repositories": [
         "${OSV_BASE}/apps",
         "${OSV_BASE}/modules"
     ]
    },
-   "default": [ "cloud-init", "httpserver" ]
+   "default": [ "cloud-init", "httpserver", "mysql56" ]
 }

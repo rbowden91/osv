@@ -44,8 +44,7 @@ struct buf: boost::intrusive::list_base_hook<> {
 	int		b_flags;	/* see defines below */
 	struct device	*b_dev;		/* device */
 	int		b_blkno;	/* block # on device */
-	mutex_t		b_lock;		/* lock for access */
-	void		*b_data;	/* pointer to data buffer */
+	char		b_data[BSIZE];	/* data buffer */
 };
 
 /*
@@ -58,8 +57,8 @@ struct buf: boost::intrusive::list_base_hook<> {
 #define	B_DONE		0x00000010	/* I/O completed. */
 
 __BEGIN_DECLS
-struct buf *getblk(struct device *, int);
-int	bread(struct device *, int, struct buf **);
+void getblk(struct device *, int, struct buf *);
+int	bread(struct device *, int, struct buf *);
 int	bwrite(struct buf *);
 void	bdwrite(struct buf *);
 void	binval(struct device *);

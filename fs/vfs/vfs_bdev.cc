@@ -20,7 +20,7 @@
 int
 bdev_read(struct device *dev, struct uio *uio, int ioflags)
 {
-	struct buf *bp;
+	struct buf bp;
 	int ret;
 
 	assert(uio->uio_rw == UIO_READ);
@@ -44,8 +44,7 @@ bdev_read(struct device *dev, struct uio *uio, int ioflags)
 		if (ret)
 			return ret;
 
-		ret = uiomove(bp->b_data, BSIZE, uio);
-		brelse(bp);
+		ret = uiomove(&bp.b_data, BSIZE, uio);
 
 		if (ret)
 			return ret;
@@ -57,7 +56,7 @@ bdev_read(struct device *dev, struct uio *uio, int ioflags)
 int
 bdev_write(struct device *dev, struct uio *uio, int ioflags)
 {
-	struct buf *bp;
+	struct buf bp;
 	int ret;
 
 	assert(uio->uio_rw == UIO_WRITE);
@@ -77,15 +76,13 @@ bdev_write(struct device *dev, struct uio *uio, int ioflags)
 		return 0;
     
 	while (uio->uio_resid > 0) {
-		bp = getblk(dev, uio->uio_offset >> 9);
+		getblk(dev, uio->uio_offset >> 9, &bp);
 
-		ret = uiomove(bp->b_data, BSIZE, uio);
-		if (ret) {
-			brelse(bp);
+		ret = uiomove(&bp.b_data, BSIZE, uio);
+		if (ret)
 			return ret;
-		}
 
-		ret = bwrite(bp);
+		ret = bwrite(&bp);
 		if (ret)
 			return ret;
 	}

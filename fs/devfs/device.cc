@@ -103,7 +103,7 @@ struct partition_table_entry {
  */
 void read_partition_table(struct device *dev)
 {
-	struct buf *bp;
+	struct buf bp;
 	unsigned long offset;
 	int index;
 
@@ -114,7 +114,7 @@ void read_partition_table(struct device *dev)
 		char dev_name[MAXDEVNAME];
 		struct device *new_dev;
 
-		auto* entry = static_cast<struct partition_table_entry*>(bp->b_data + offset);
+		auto* entry = static_cast<struct partition_table_entry*>((void *)bp.b_data + offset);
 
 		if (entry->system_id == 0) {
 			continue;
@@ -136,7 +136,6 @@ void read_partition_table(struct device *dev)
 	}
 
 	sched_unlock();
-	brelse(bp);
 }
 
 void device_register(struct device *dev, const char *name, int flags)

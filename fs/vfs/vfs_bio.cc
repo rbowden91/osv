@@ -51,67 +51,10 @@
 #include "vfs.h"
 #include <boost/intrusive/list.hpp>
 
-/* number of buffer cache */
-#define NBUFS		256
-
 /* macros to clear/set/test flags. */
 #define	SET(t, f)	(t) |= (f)
 #define	CLR(t, f)	(t) &= ~(f)
 #define	ISSET(t, f)	((t) & (f))
-
-/*
- * Global lock to access all buffer headers and lists.
- */
-static mutex bio_lock;
-
-/* fixed set of buffers */
-static struct buf buf_table[NBUFS];
-boost::intrusive::list<struct buf, boost::intrusive::base_hook<struct buf>> free_list;
-
-static sem_t free_sem;
-
-/*
- * Insert buffer to the head of free list
- */
-static void
-bio_insert_head(struct buf *bp)
-{
-	free_list.push_front(*bp);
-	sem_post(&free_sem);
-}
-
-/*
- * Insert buffer to the tail of free list
- */
-static void
-bio_insert_tail(struct buf *bp)
-{
-	free_list.push_back(*bp);
-	sem_post(&free_sem);
-}
-
-/*
- * Remove buffer from free list
- */
-static void
-bio_remove(struct buf *bp)
-{
-	sem_wait(&free_sem);
-	free_list.erase(free_list.iterator_to(*bp));
-}
-
-/*
- * Remove buffer from the head of free list
- */
-static struct buf *
-bio_remove_head(void)
-{
-	sem_wait(&free_sem);
-	auto& bp = free_list.front();
-	free_list.pop_front();
-	return &bp;
-}
-
 
 static int
 rw_buf(struct buf *bp, int rw)
@@ -123,32 +66,30 @@ rw_buf(struct buf *bp, int rw)
 	if (!bio)
 		return ENOMEM;
 
-	bio->bio_cmd = rw ? BIO_WRITE : BIO_READ;
+	// XXX ROB: Why does this have to be malloc'd?
+	bio->bio_data = malloc(BSIZE);
+	if (rw) {
+		bio->bio_cmd = BIO_WRITE;
+		memcpy(bio->bio_data, bp->b_data, BSIZE);
+	}
+	else {
+		bio->bio_cmd = BIO_READ;
+	}
+
 	bio->bio_dev = bp->b_dev;
-	bio->bio_data = bp->b_data;
 	bio->bio_offset = bp->b_blkno << 9;
 	bio->bio_bcount = BSIZE;
 
 	bio->bio_dev->driver->devops->strategy(bio);
 	ret = bio_wait(bio);
 
+	if (!rw) {
+		memcpy(bp->b_data, bio->bio_data, BSIZE);
+	}
+
+	free(bio->bio_data);
 	destroy_bio(bio);
 	return ret;
-}
-
-/*
- * Determine if a block is in the cache.
- */
-static struct buf *
-incore(struct device *dev, int blkno)
-{
-	for (int i = 0; i < NBUFS; i++) {
-		auto* bp = &buf_table[i];
-		if (bp->b_blkno == blkno && bp->b_dev == dev &&
-		    !ISSET(bp->b_flags, B_INVAL))
-			return bp;
-	}
-	return nullptr;
 }
 
 /*
@@ -159,43 +100,14 @@ incore(struct device *dev, int blkno)
  * block list, return it.  Otherwise, the least recently used
  * block is used.
  */
-struct buf *
-getblk(struct device *dev, int blkno)
+void
+getblk(struct device *dev, int blkno, struct buf *bp)
 {
 	DPRINTF(VFSDB_BIO, ("getblk: dev=%x blkno=%d\n", dev, blkno));
-	SCOPE_LOCK(bio_lock);
-start:
-	auto* bp = incore(dev, blkno);
-	if (bp != nullptr) {
-		/* Block found in cache. */
-		if (ISSET(bp->b_flags, B_BUSY)) {
-			/*
-			 * Wait buffer ready.
-			 */
-			DROP_LOCK(bio_lock) {
-				mutex_lock(&bp->b_lock);
-				mutex_unlock(&bp->b_lock);
-			}
-			/* Scan again if it's busy */
-			goto start;
-		}
-		bio_remove(bp);
-		SET(bp->b_flags, B_BUSY);
-	} else {
-		bp = bio_remove_head();
-		if (ISSET(bp->b_flags, B_DELWRI)) {
-			DROP_LOCK(bio_lock) {
-				bwrite(bp);
-			}
-			goto start;
-		}
-		bp->b_flags = B_BUSY;
-		bp->b_dev = dev;
-		bp->b_blkno = blkno;
-	}
-	mutex_lock(&bp->b_lock);
+	bp->b_flags = B_BUSY;
+	bp->b_dev = dev;
+	bp->b_blkno = blkno;
 	DPRINTF(VFSDB_BIO, ("getblk: done bp=%x\n", bp));
-	return bp;
 }
 
 /*
@@ -204,17 +116,6 @@ start:
 void
 brelse(struct buf *bp)
 {
-	ASSERT(ISSET(bp->b_flags, B_BUSY));
-	DPRINTF(VFSDB_BIO, ("brelse: bp=%x dev=%x blkno=%d\n",
-				bp, bp->b_dev, bp->b_blkno));
-
-	SCOPE_LOCK(bio_lock);
-	CLR(bp->b_flags, B_BUSY);
-	mutex_unlock(&bp->b_lock);
-	if (ISSET(bp->b_flags, B_INVAL))
-		bio_insert_head(bp);
-	else
-		bio_insert_tail(bp);
 }
 
 /*
@@ -227,23 +128,19 @@ brelse(struct buf *bp)
  * buffer is dirty.
  */
 int
-bread(struct device *dev, int blkno, struct buf **bpp)
+bread(struct device *dev, int blkno, struct buf *bp)
 {
 	DPRINTF(VFSDB_BIO, ("bread: dev=%x blkno=%d\n", dev, blkno));
-	auto* bp = getblk(dev, blkno);
+	getblk(dev, blkno, bp);
 
-	if (!ISSET(bp->b_flags, (B_DONE | B_DELWRI))) {
-		auto error = rw_buf(bp, 0);
-		if (error) {
-			DPRINTF(VFSDB_BIO, ("bread: i/o error\n"));
-			brelse(bp);
-			return error;
-		}
+	auto error = rw_buf(bp, 0);
+	if (error) {
+		DPRINTF(VFSDB_BIO, ("bread: i/o error\n"));
+		return error;
 	}
 	CLR(bp->b_flags, B_INVAL);
 	SET(bp->b_flags, (B_READ | B_DONE));
 	DPRINTF(VFSDB_BIO, ("bread: done bp=%x\n\n", bp));
-	*bpp = bp;
 	return 0;
 }
 
@@ -260,18 +157,12 @@ bwrite(struct buf *bp)
 	ASSERT(ISSET(bp->b_flags, B_BUSY));
 	DPRINTF(VFSDB_BIO, ("bwrite: dev=%x blkno=%d\n", bp->b_dev,
 			    bp->b_blkno));
-
-	WITH_LOCK(bio_lock) {
-		CLR(bp->b_flags, (B_READ | B_DONE | B_DELWRI));
-	}
+	CLR(bp->b_flags, (B_READ | B_DONE | B_DELWRI));
 
 	auto error = rw_buf(bp, 1);
 	if (error)
 		return error;
-	WITH_LOCK(bio_lock) {
-		SET(bp->b_flags, B_DONE);
-	}
-	brelse(bp);
+	SET(bp->b_flags, B_DONE);
 	return 0;
 }
 
@@ -285,12 +176,6 @@ bwrite(struct buf *bp)
 void
 bdwrite(struct buf *bp)
 {
-
-	WITH_LOCK(bio_lock) {
-		SET(bp->b_flags, B_DELWRI);
-		CLR(bp->b_flags, B_DONE);
-	}
-	brelse(bp);
 }
 
 /*
@@ -299,10 +184,6 @@ bdwrite(struct buf *bp)
 void
 bflush(struct buf *bp)
 {
-	WITH_LOCK(bio_lock) {
-		if (ISSET(bp->b_flags, B_DELWRI))
-			bwrite(bp);
-	}
 }
 
 /*
@@ -312,17 +193,6 @@ bflush(struct buf *bp)
 void
 binval(struct device *dev)
 {
-	SCOPE_LOCK(bio_lock);
-	for (auto i = 0; i < NBUFS; i++) {
-		auto* bp = &buf_table[i];
-		if (bp->b_dev == dev) {
-			if (ISSET(bp->b_flags, B_DELWRI))
-				bwrite(bp);
-			else if (ISSET(bp->b_flags, B_BUSY))
-				brelse(bp);
-			bp->b_flags = B_INVAL;
-		}
-	}
 }
 
 /*
@@ -332,20 +202,6 @@ binval(struct device *dev)
 void
 bio_sync(void)
 {
-	SCOPE_LOCK(bio_lock);
-start:
-	for (int i = 0; i < NBUFS; i++) {
-		auto* bp = &buf_table[i];
-		if (ISSET(bp->b_flags, B_BUSY)) {
-			DROP_LOCK(bio_lock) {
-				mutex_lock(&bp->b_lock);
-				mutex_unlock(&bp->b_lock);
-			}
-			goto start;
-		}
-		if (ISSET(bp->b_flags, B_DELWRI))
-			bwrite(bp);
-	}
 }
 
 /*
@@ -354,15 +210,4 @@ start:
 void
 bio_init(void)
 {
-	for (int i = 0; i < NBUFS; i++) {
-		auto* bp = &buf_table[i];
-		bp->b_flags = B_INVAL;
-		bp->b_data = malloc(BSIZE);
-		mutex_init(&bp->b_lock);
-		free_list.push_back(*bp);
-	}
-	sem_init(&free_sem, 0, NBUFS);
-
-	DPRINTF(VFSDB_BIO, ("bio: Buffer cache size %dK bytes\n",
-			    BSIZE * NBUFS / 1024));
 }
